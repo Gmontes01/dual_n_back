@@ -1,0 +1,140 @@
+// P2P web client for the dual n-back game (v0.2.0).
+// There is no lobby in the browser any more: the game
+// instance you are looking at already did the Host/Join
+// handshake on the command line. This page just asks the
+// local instance who you are (/api/info), then polls
+// /api/state every 250ms and sends button presses to
+// /api/respond. The instance forwards your presses to
+// your peer over its direct TCP link.
+
+let room = "P2P", token = null;
+let currentTrial = -1;
+let pressedPos = false, pressedAudio = false;
+let lastSpokenTrial = -1;
+
+const $ = (id) => document.getElementById(id);
+const grid = $("grid");
+for (let i = 0; i < 9; i++) {
+  const d = document.createElement("div");
+  d.className = "cell";
+  d.id = "cell" + i;
+  grid.appendChild(d);
+}
+
+function speak(letter) {
+  if (!("speechSynthesis" in window)) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(letter);
+  u.rate = 1.1;
+  window.speechSynthesis.speak(u);
+}
+
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+async function init() {
+  try {
+    const info = await (await fetch("/api/info")).json();
+    token = info.token;
+    $("mode").textContent = info.mode;
+    $("modeLine").textContent =
+      info.mode === "host"
+        ? "You are the host. Your opponent connected directly to this instance."
+        : "You joined the host at " + info.peer + ".";
+  } catch (e) {
+    $("modeLine").textContent = "Could not reach the local game instance.";
+    return;
+  }
+  setInterval(poll, 250);
+  poll();
+}
+
+async function poll() {
+  if (!token) return;
+  let s;
+  try {
+    const r = await fetch(`/api/state?room=${room}&token=${token}`);
+    s = await r.json();
+  } catch (e) { return; }
+  if (s.error) { $("statusLine").textContent = s.error; return; }
+
+  document.querySelectorAll(".nlabel").forEach((el) => { el.textContent = s.n; });
+  $("totalTrials").textContent = s.total_trials;
+  $("yourScore").textContent = s.your_score;
+  $("oppScore").textContent = s.opponent_score;
+  $("hits").textContent = s.your_hits;
+  $("fa").textContent = s.your_false_alarms;
+  $("misses").textContent = s.your_misses;
+
+  if (s.status === "waiting") {
+    $("statusLine").textContent = "Waiting for peer to connect…";
+    $("trialNum").textContent = "-";
+    return;
+  }
+
+  if (s.status === "finished") {
+    $("statusLine").textContent = s.peer_connected
+      ? "Game over."
+      : "Game over. (Peer disconnected.)";
+    $("trialNum").textContent = s.total_trials;
+    $("result").textContent =
+      s.winner === 1 ? "You win!" :
+      s.winner === 2 ? "Opponent wins." : "Tie game.";
+    return;
+  }
+
+  // playing
+  $("statusLine").textContent = s.peer_connected
+    ? "Playing — watch and listen."
+    : "Playing — peer disconnected, their score is frozen.";
+  $("trialNum").textContent = s.trial + 1;
+  $("barfill").style.width = (100 * s.trial_remaining_ms / s.trial_ms) + "%";
+
+  if (s.trial !== currentTrial) {
+    currentTrial = s.trial;
+    pressedPos = false; pressedAudio = false;
+    $("posBtn").classList.remove("pressed");
+    $("audioBtn").classList.remove("pressed");
+    for (let i = 0; i < 9; i++) $("cell" + i).classList.remove("on");
+    if (s.pos !== null) $("cell" + s.pos).classList.add("on");
+    $("letter").textContent = s.letter || "";
+    if (s.letter && s.trial !== lastSpokenTrial) {
+      lastSpokenTrial = s.trial;
+      speak(s.letter);
+    }
+  }
+}
+
+async function sendResponse() {
+  if (currentTrial < 0 || !token) return;
+  await post("/api/respond", {
+    room, token, trial: currentTrial,
+    position: pressedPos, audio: pressedAudio,
+  });
+}
+
+$("posBtn").onclick = () => {
+  if (currentTrial < 0) return;
+  pressedPos = true;
+  $("posBtn").classList.add("pressed");
+  sendResponse();
+};
+$("audioBtn").onclick = () => {
+  if (currentTrial < 0) return;
+  pressedAudio = true;
+  $("audioBtn").classList.add("pressed");
+  sendResponse();
+};
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "f" || e.key === "F") $("posBtn").click();
+  if (e.key === "j" || e.key === "J") $("audioBtn").click();
+});
+
+init();
