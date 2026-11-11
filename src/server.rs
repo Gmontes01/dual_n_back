@@ -27,7 +27,7 @@
 //! If you later move to Axum, replace this module with serde
 //! structs and keep `engine.rs` untouched.
 
-use crate::engine::{generate_sequence, matches, score_trial, Stimulus};
+use crate::engine::{PlayerStats, Rng, SequenceStream};
 use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,17 +85,33 @@ const CODE_LETTERS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
 #[derive(Clone)]
 pub struct Player {
     pub token: String,
+    /// Cumulative score, hits, false alarms, and misses tracked by `engine.rs`.
+    pub stats: PlayerStats,
     /// trial -> (position pressed, audio pressed), merged with OR
     /// so a client that re-sends cumulative flags cannot un-press.
     pub responses: HashMap<usize, (bool, bool)>,
 }
 
+impl Player {
+    pub fn new(token: String) -> Self {
+        Self {
+            token,
+            stats: PlayerStats::new(),
+            responses: HashMap::new(),
+        }
+    }
+}
+
 pub struct Room {
     pub code: String,
-    pub n: usize,
-    pub sequence: Vec<Stimulus>,
+    pub stream: SequenceStream,
     pub players: Vec<Player>,
     pub started_at: Option<Instant>,
+    /// Number of completed trials already scored into each player's `PlayerStats`.
+    pub scored_trials: usize,
+    /// Match flags `(exp_pos, exp_audio)` for the most recently scored trial,
+    /// used if a valid late press arrives within the grace/latency window.
+    pub last_scored_matches: (bool, bool),
     /// P2P only: true while the peer TCP link is up. The room
     /// always has 2 players (you + peer), so this is the live
     /// connection flag, not the player count.
@@ -103,6 +119,28 @@ pub struct Room {
 }
 
 impl Room {
+    pub fn new(
+        code: String,
+        n: usize,
+        seed: u64,
+        players: Vec<Player>,
+        started_at: Option<Instant>,
+    ) -> Self {
+        Self {
+            code,
+            stream: SequenceStream::new(seed, n),
+            players,
+            started_at,
+            scored_trials: 0,
+            last_scored_matches: (false, false),
+            peer_connected: false,
+        }
+    }
+
+    pub fn n(&self) -> usize {
+        self.stream.n()
+    }
+
     pub fn status(&self) -> &'static str {
         match self.started_at {
             None => "waiting",
@@ -149,45 +187,75 @@ impl Room {
             _ => 0,
         }
     }
-}
 
-/// (score, hits, false alarms, misses) for one player over the
-/// completed trials. Recomputed on demand -- 20 trials is cheap,
-/// and recomputing means scoring can never drift from responses.
-pub fn player_stats(room: &Room, player: &Player) -> (i32, u32, u32, u32) {
-    let mut score = 0;
-    let mut hits = 0;
-    let mut false_alarms = 0;
-    let mut misses = 0;
-    for t in 0..room.completed_trials() {
-        let (exp_pos, exp_audio) = matches(&room.sequence, t, room.n);
-        let (pressed_pos, pressed_audio) = player.responses.get(&t).copied().unwrap_or((false, false));
-        score += score_trial(exp_pos, exp_audio, pressed_pos, pressed_audio);
-        if exp_pos && pressed_pos {
-            hits += 1;
+    /// Advance `stream` on the fly up to the current trial and feed any
+    /// newly completed trials into each player's `PlayerStats`.
+    pub fn sync(&mut self) {
+        let completed = self.completed_trials();
+        for t in self.scored_trials..completed {
+            if self.stream.trials_generated() == t {
+                self.stream.next_trial();
+            }
+            let (exp_pos, exp_audio) = self.stream.current_matches();
+            for player in &mut self.players {
+                let (pressed_pos, pressed_audio) = player
+                    .responses
+                    .get(&t)
+                    .copied()
+                    .unwrap_or((false, false));
+                player
+                    .stats
+                    .record_trial(exp_pos, exp_audio, pressed_pos, pressed_audio);
+            }
+            self.last_scored_matches = (exp_pos, exp_audio);
+            self.scored_trials = t + 1;
         }
-        if exp_audio && pressed_audio {
-            hits += 1;
-        }
-        if !exp_pos && pressed_pos {
-            false_alarms += 1;
-        }
-        if !exp_audio && pressed_audio {
-            false_alarms += 1;
-        }
-        if exp_pos && !pressed_pos {
-            misses += 1;
-        }
-        if exp_audio && !pressed_audio {
-            misses += 1;
+        if self.status() == "playing" && self.stream.trials_generated() == completed {
+            self.stream.next_trial();
         }
     }
-    (score, hits, false_alarms, misses)
+
+    fn record_player_press(
+        &mut self,
+        idx: usize,
+        trial: usize,
+        pressed_pos: bool,
+        pressed_audio: bool,
+        pressed_at_ms: u64,
+    ) -> bool {
+        if self.status() == "waiting" {
+            return false;
+        }
+        self.sync();
+        if trial > self.completed_trials() {
+            return false;
+        }
+        let arrival_ms = self
+            .started_at
+            .map(|s| s.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        if !valid_press(trial, pressed_at_ms, arrival_ms) {
+            return false;
+        }
+        let player = &mut self.players[idx];
+        let entry = player.responses.entry(trial).or_insert((false, false));
+        let new_pos = pressed_pos && !entry.0;
+        let new_audio = pressed_audio && !entry.1;
+        entry.0 |= pressed_pos;
+        entry.1 |= pressed_audio;
+
+        if trial < self.scored_trials {
+            let (exp_pos, exp_audio) = self.last_scored_matches;
+            player.stats.apply_late_press(exp_pos, new_pos);
+            player.stats.apply_late_press(exp_audio, new_audio);
+        }
+        true
+    }
 }
 
 pub struct ServerState {
     pub rooms: HashMap<String, Room>,
-    counter: u64,
+    rng: Rng,
 }
 
 impl ServerState {
@@ -198,24 +266,15 @@ impl ServerState {
             .unwrap_or(0x12345678);
         Self {
             rooms: HashMap::new(),
-            counter: seed,
+            rng: Rng::new(seed),
         }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        // SplitMix64, same family as the engine RNG.
-        self.counter = self.counter.wrapping_add(0x9e3779b97f4a7c15);
-        let mut x = self.counter;
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^ (x >> 31)
     }
 
     fn new_code(&mut self) -> String {
         loop {
             let mut code = String::with_capacity(4);
             for _ in 0..4 {
-                let idx = (self.next_u64() % CODE_LETTERS.len() as u64) as usize;
+                let idx = self.rng.next_below(CODE_LETTERS.len() as u64) as usize;
                 code.push(CODE_LETTERS[idx] as char);
             }
             if !self.rooms.contains_key(&code) {
@@ -225,7 +284,7 @@ impl ServerState {
     }
 
     fn new_token(&mut self) -> String {
-        format!("{:016x}{:016x}", self.next_u64(), self.next_u64())
+        format!("{:016x}{:016x}", self.rng.next_u64(), self.rng.next_u64())
     }
 
     /// Create a room as player 1. Returns (room code, token).
@@ -233,26 +292,21 @@ impl ServerState {
         let n = n.clamp(1, 3);
         let code = self.new_code();
         let token = self.new_token();
-        let seed = self.next_u64();
-        let sequence = generate_sequence(seed, n, TOTAL_TRIALS);
-        let room = Room {
-            code: code.clone(),
+        let seed = self.rng.next_u64();
+        let room = Room::new(
+            code.clone(),
             n,
-            sequence,
-            players: vec![Player {
-                token: token.clone(),
-                responses: HashMap::new(),
-            }],
-            started_at: None,
-            peer_connected: false,
-        };
+            seed,
+            vec![Player::new(token.clone())],
+            None,
+        );
         self.rooms.insert(code.clone(), room);
         (code, token)
     }
 
     /// P2P room: one local room per game instance, built from
-    /// a shared seed so both instances generate the identical
-    /// sequence. players[0] is always you, players[1] is
+    /// a shared seed so both instances advance the identical
+    /// `SequenceStream`. players[0] is always you, players[1] is
     /// always the peer, on both sides. Returns
     /// (code, your_token, peer_token). The game does NOT start
     /// here: the host starts it when it sends Start, the
@@ -261,24 +315,13 @@ impl ServerState {
         let n = n.clamp(1, 3);
         let your_token = self.new_token();
         let peer_token = self.new_token();
-        let sequence = generate_sequence(seed, n, TOTAL_TRIALS);
-        let room = Room {
-            code: "P2P".to_string(),
+        let room = Room::new(
+            "P2P".to_string(),
             n,
-            sequence,
-            players: vec![
-                Player {
-                    token: your_token.clone(),
-                    responses: HashMap::new(),
-                },
-                Player {
-                    token: peer_token.clone(),
-                    responses: HashMap::new(),
-                },
-            ],
-            started_at: None,
-            peer_connected: false,
-        };
+            seed,
+            vec![Player::new(your_token.clone()), Player::new(peer_token.clone())],
+            None,
+        );
         self.rooms.insert("P2P".to_string(), room);
         ("P2P".to_string(), your_token, peer_token)
     }
@@ -287,23 +330,19 @@ impl ServerState {
     /// starts immediately on creation, so `cargo run -- solo`
     /// is playing within a second of starting. Returns
     /// (code, your_token). Scoring is identical to 1v1 — the
-    /// same sequence generator, same +10 / -5 table — so a
+    /// same sequence stream, same +10 / -5 table — so a
     /// solo score is directly comparable to a 1v1 score.
     pub fn create_solo_room(&mut self, n: usize, seed: u64) -> (String, String) {
         let n = n.clamp(1, 3);
         let your_token = self.new_token();
-        let sequence = generate_sequence(seed, n, TOTAL_TRIALS);
-        let room = Room {
-            code: "SOLO".to_string(),
+        let mut room = Room::new(
+            "SOLO".to_string(),
             n,
-            sequence,
-            players: vec![Player {
-                token: your_token.clone(),
-                responses: HashMap::new(),
-            }],
-            started_at: Some(Instant::now()),
-            peer_connected: false,
-        };
+            seed,
+            vec![Player::new(your_token.clone())],
+            Some(Instant::now()),
+        );
+        room.sync();
         self.rooms.insert("SOLO".to_string(), room);
         ("SOLO".to_string(), your_token)
     }
@@ -331,6 +370,7 @@ impl ServerState {
             now.checked_sub(std::time::Duration::from_millis(back_ms))
                 .unwrap_or(now),
         );
+        room.sync();
         true
     }
 
@@ -369,26 +409,7 @@ impl ServerState {
         let Some(room) = self.rooms.get_mut(code) else {
             return false;
         };
-        if room.status() == "waiting" {
-            return false;
-        }
-        if trial > room.completed_trials() {
-            return false;
-        }
-        let arrival_ms = room
-            .started_at
-            .map(|s| s.elapsed().as_millis() as u64)
-            .unwrap_or(0);
-        if !valid_press(trial, pressed_at_ms, arrival_ms) {
-            return false;
-        }
-        let entry = room.players[1]
-            .responses
-            .entry(trial)
-            .or_insert((false, false));
-        entry.0 |= pressed_pos;
-        entry.1 |= pressed_audio;
-        true
+        room.record_player_press(1, trial, pressed_pos, pressed_audio, pressed_at_ms)
     }
 
     /// Join a waiting room as player 2. The game starts the
@@ -401,11 +422,9 @@ impl ServerState {
         if room.players.len() != 1 || room.started_at.is_some() {
             return None;
         }
-        room.players.push(Player {
-            token: token.clone(),
-            responses: HashMap::new(),
-        });
+        room.players.push(Player::new(token.clone()));
         room.started_at = Some(Instant::now());
+        room.sync();
         Some(token)
     }
 
@@ -432,36 +451,20 @@ impl ServerState {
         let Some(room) = self.rooms.get_mut(code) else {
             return false;
         };
-        if room.status() == "waiting" {
-            return false;
-        }
-        if trial > room.completed_trials() {
-            return false;
-        }
-        let arrival_ms = room
-            .started_at
-            .map(|s| s.elapsed().as_millis() as u64)
-            .unwrap_or(0);
-        if !valid_press(trial, pressed_at_ms, arrival_ms) {
-            return false;
-        }
         let Some(idx) = Self::player_index(room, token) else {
             return false;
         };
-        let entry = room.players[idx]
-            .responses
-            .entry(trial)
-            .or_insert((false, false));
-        entry.0 |= pressed_pos;
-        entry.1 |= pressed_audio;
-        true
+        room.record_player_press(idx, trial, pressed_pos, pressed_audio, pressed_at_ms)
     }
 
-    /// Full state JSON for one player. Never reveals future
-    /// stimuli, the opponent's presses, or the other token.
-    pub fn state_json(&self, code: &str, token: &str) -> Option<String> {
-        let room = self.rooms.get(code)?;
+    /// Full state JSON for one player. Advances the room's
+    /// `SequenceStream` to the current trial, updates both
+    /// players' engine-tracked `PlayerStats`, and never reveals
+    /// future stimuli, the opponent's presses, or the other token.
+    pub fn state_json(&mut self, code: &str, token: &str) -> Option<String> {
+        let room = self.rooms.get_mut(code)?;
         let you = Self::player_index(room, token)?;
+        room.sync();
         let status = room.status();
         let trial: i64 = match status {
             "playing" => room.current_trial().unwrap_or(0) as i64,
@@ -469,16 +472,20 @@ impl ServerState {
             _ => -1,
         };
         let (pos_json, letter_json) = match room.current_trial() {
-            Some(t) => {
-                let s = room.sequence[t];
-                (s.pos.to_string(), format!("\"{}\"", s.letter))
-            }
+            Some(_) => match room.stream.current() {
+                Some(s) => (s.pos.to_string(), format!("\"{}\"", s.letter)),
+                None => ("null".to_string(), "null".to_string()),
+            },
             None => ("null".to_string(), "null".to_string()),
         };
-        let (your_score, your_hits, your_fa, your_misses) = player_stats(room, &room.players[you]);
+        let your_stats = room.players[you].stats;
+        let your_score = your_stats.score;
+        let your_hits = your_stats.hits;
+        let your_fa = your_stats.false_alarms;
+        let your_misses = your_stats.misses;
         let (opp_score, opp_joined) = if room.players.len() > 1 {
             let opp = 1 - you;
-            (player_stats(room, &room.players[opp]).0, true)
+            (room.players[opp].stats.score, true)
         } else {
             (0, false)
         };
@@ -502,7 +509,7 @@ impl ServerState {
         // for player 2 would invert the result for that player.
         Some(format!(
             "{{\"status\":\"{status}\",\"code\":\"{code}\",\"solo\":{solo},\"n\":{},\"total_trials\":{},\"trial_ms\":{},\"trial\":{trial},\"trial_remaining_ms\":{},\"pos\":{pos_json},\"letter\":{letter_json},\"you\":{},\"your_score\":{your_score},\"your_hits\":{your_hits},\"your_false_alarms\":{your_fa},\"your_misses\":{your_misses},\"opponent_score\":{opp_score},\"opponent_joined\":{opp_joined},\"peer_connected\":{},\"winner\":{winner_json}}}",
-            room.n,
+            room.n(),
             TOTAL_TRIALS,
             TRIAL_MS,
             room.trial_remaining_ms(),
@@ -617,14 +624,15 @@ mod tests {
     #[test]
     fn p2p_room_shares_seed_and_records_peer_inputs() {
         // Both instances build from the same seed: identical
-        // sequences, so both can score both players locally.
+        // SequenceStreams, so both can score both players locally.
         let mut a = ServerState::new();
         let mut b = ServerState::new();
         let (code_a, token_a, _) = a.create_p2p_room(2, 4242);
         let (code_b, token_b, _) = b.create_p2p_room(2, 4242);
-        assert_eq!(a.rooms[&code_a].sequence, b.rooms[&code_b].sequence);
+        assert_eq!(a.rooms[&code_a].stream, b.rooms[&code_b].stream);
         assert!(a.start_room(&code_a));
         assert!(b.start_room(&code_b));
+        assert_eq!(a.rooms[&code_a].stream.current(), b.rooms[&code_b].stream.current());
         // Your press counts for the current trial.
         assert!(a.record_response(&code_a, &token_a, 0, true, false, 100));
         // A peer press for trial 0 counts on the other side,

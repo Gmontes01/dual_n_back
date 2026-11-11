@@ -439,7 +439,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, app: Arc<App>) {
             let room = query_param(query, "room").unwrap_or(&app.room);
             let token = query_param(query, "token").unwrap_or(&app.your_token);
             let state_result = {
-                let locked = app.state.lock().unwrap();
+                let mut locked = app.state.lock().unwrap();
                 locked.state_json(room, token)
             };
             match state_result {
